@@ -2,29 +2,30 @@ import sys
 import os
 import json
 import re
-import subprocess
+import time
+from pathlib import Path
+from collections import defaultdict, deque
+from PyQt6.QtGui import QColor, QBrush
+
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
-    QTableWidgetItem, QComboBox, QPushButton, QLabel, QListView, QHeaderView
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QTableWidget, QTableWidgetItem, QComboBox,
+    QPushButton, QLabel, QListView, QHeaderView, QCheckBox
 )
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import Qt, QTimer
 
-# ---------- CONFIGURATION ----------
-def get_base_dir():
-    # When compiled with PyInstaller, __file__ points into _MEI temp extraction.
-    # sys.executable points to the actual .exe location on disk.
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+# ===================== CONFIG =====================
+CACHED_SKINS_DIR = Path(
+    r"D:\Hytale\install\release\package\game\latest\Client\UserData\CachedPlayerSkins"
+)
 
-BASE_DIR = get_base_dir()
+# Cooldown behavior
+WRITE_QUIET_MS = 600          # how long the file must be quiet before we reconcile
+RECONCILE_DELAY_MS = 80       # small delay after detecting overwrite
+HEATMAP_WINDOW = 10           # number of recent checks to consider
+HEATMAP_ESCALATE = (3, 6)     # amber at >=3, red at >=6 conflicts in window
 
-AVATAR_PRESETS_PATH = os.path.join(BASE_DIR, "install", "release", "package", "game", "latest", "Client", "Data", "Game", "AvatarPresets.json")
-EDITOR_PATH = os.path.join(BASE_DIR, "AvatarPresetEditor.json")  # Merged editor + last preset
-LAUNCHER_PATH = os.path.join(BASE_DIR, "HytaleLauncher.exe")
-Hytale_CLIENT_EXE = "HytaleClient.exe"
-
-# ---------- ALLOWED VALUES ----------
+# Allowed cosmetic keys & values (schema-safe gate)
 ALLOWED_KEY_VALUES = {
     "bodyCharacteristic": {
         "Default.1",
@@ -33093,231 +33094,267 @@ ALLOWED_KEY_VALUES = {
 }
 
 
-# ---------- UTILITY FUNCTIONS ----------
-def sort_human_readable(values):
-    def alphanum_key(s):
-        return [int(text) if text.isdigit() else text.lower() for text in re.split("([0-9]+)", s)]
-    return sorted(values, key=alphanum_key)
 
-def load_json(path, default=None):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return default if default is not None else {}
-    return default if default is not None else {}
+# ===================== UTIL =====================
+def sort_human(values):
+    def key(s):
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+    return sorted(values, key=key)
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def atomic_write(path: Path, data: dict):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
+    tmp.replace(path)
 
-def load_avatar_presets(path):
-    """Load AvatarPresets.json as list, convert to {PresetName: data} dict."""
-    data_list = load_json(path, [])
-    presets = {}
-    for idx, item in enumerate(data_list):
-        preset_name = item.get("Id", f"Preset{idx+1}")
-        presets[preset_name] = item
-    return presets
+def newest_skin_file():
+    files = list(CACHED_SKINS_DIR.glob("*.json"))
+    if not files:
+        raise FileNotFoundError("No CachedPlayerSkins JSON files found.")
+    return max(files, key=lambda p: p.stat().st_mtime)
 
-def save_avatar_preset(path, preset_name, preset_data):
-    """Save only the current preset to AvatarPresets.json as a list."""
-    data = preset_data.copy()
-    if "Id" not in data:
-        data["Id"] = preset_name
-    save_json(path, [data])
-
-def is_process_running(image_name: str) -> bool:
-    """Return True if a Windows process with this image name is running."""
-    if os.name != "nt":
-        return False
-
-    CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        output = subprocess.check_output(
-            ["tasklist", "/FI", f"IMAGENAME eq {image_name}"],
-            text=True,
-            creationflags=CREATE_NO_WINDOW
-        )
-        # If running, tasklist output will include the image name.
-        return image_name.lower() in output.lower()
-    except Exception:
-        return False
-
-
-def taskkill_if_running(image_name: str) -> bool:
-    """Kill the process if it's running. Returns True if we attempted a kill."""
-    if not is_process_running(image_name):
-        return False
-
-    CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.run(
-        ["taskkill", "/F", "/IM", image_name],
-        check=False,
-        creationflags=CREATE_NO_WINDOW
-    )
-    return True
-
-# ---------- GUI CLASS ----------
-class AvatarEditor(QWidget):
+# ===================== GUI =====================
+class CachedSkinEditor(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Hytale Avatar Preset Editor")
-        self.resize(950, 600)
+        self.setWindowTitle("Hytale Cached Skin Editor (Cooldown + Heatmap)")
+        self.resize(980, 640)
 
-        # Load AvatarPresets.json first (source of truth)
-        avatar_presets = load_avatar_presets(AVATAR_PRESETS_PATH)
-        if not avatar_presets:
-            raise FileNotFoundError(f"No presets found in AvatarPresets.json: {AVATAR_PRESETS_PATH}")
+        if not CACHED_SKINS_DIR.exists():
+            raise FileNotFoundError(CACHED_SKINS_DIR)
 
-        # Load editor JSON (contains all presets + last selected preset)
-        editor_data = load_json(EDITOR_PATH, {})
-        self.editor_presets = editor_data.get("Presets", {})
-        last_selected = editor_data.get("LastPreset", None)
+        self.skin_path = newest_skin_file()
+        self.skin_data = load_json(self.skin_path)
+        self.last_mtime = self.skin_path.stat().st_mtime
 
-        # Determine the currently selected preset
-        if last_selected and last_selected in self.editor_presets:
-            self.current_preset_name = last_selected
-        else:
-            self.current_preset_name = next(iter(avatar_presets))
+        # Desired intent (authoritative cosmetic state)
+        self.desired_cosmetics = {}
 
-        # Overwrite editor preset in memory with AvatarPresets.json for the currently selected preset
-        if self.current_preset_name in avatar_presets:
-            self.editor_presets[self.current_preset_name] = avatar_presets[self.current_preset_name]
-        else:
-            # If it doesn't exist in AvatarPresets, keep empty
-            self.editor_presets.setdefault(self.current_preset_name, {})
+        # Cooldown tracking
+        self.last_write_seen_at = time.time()
+        self.reconcile_scheduled = False
+
+        # Conflict heatmap tracking per key (rolling window)
+        self.conflict_history = defaultdict(lambda: deque(maxlen=HEATMAP_WINDOW))
+
+        self.auto_apply = False
 
         self.setup_ui()
-        self.setStyleSheet("""
-            QWidget { background-color: #1e1e1e; color: #c7f0a8; font-size: 12pt; }
-            QTableWidget { background-color: #2b2b2b; gridline-color: #3f7f3f; color: #c7f0a8; }
-            QHeaderView::section { background-color: #3f7f3f; color: white; font-weight: bold; }
-            QComboBox { background-color: #2b2b2b; color: #c7f0a8; }
-            QPushButton { background-color: #3f7f3f; color: white; font-weight: bold; padding: 5px; }
-            QPushButton:hover { background-color: #2f6f2f; }
-            QLabel { font-weight: bold; }
-        """)
+        self.populate_table()
 
+        # Poller for external changes
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.poll_file)
+        self.timer.start(200)  # frequent polling; cooldown prevents thrash
+
+    # ---------------- UI ----------------
     def setup_ui(self):
         layout = QVBoxLayout()
 
-        # Preset selection dropdown
-        preset_layout = QHBoxLayout()
-        self.preset_label = QLabel("Select Preset:")
-        self.preset_dropdown = QComboBox()
-        self.preset_dropdown.addItems(sorted(self.editor_presets.keys()))
-        self.preset_dropdown.setCurrentText(self.current_preset_name)
-        self.preset_dropdown.currentTextChanged.connect(self.change_preset)
-        self.new_preset_btn = QPushButton("Create New Preset")
-        self.new_preset_btn.clicked.connect(self.create_new_preset)
-        preset_layout.addWidget(self.preset_label)
-        preset_layout.addWidget(self.preset_dropdown)
-        preset_layout.addWidget(self.new_preset_btn)
-        layout.addLayout(preset_layout)
+        header = QLabel(f"Editing newest cache: {self.skin_path.name}")
+        header.setStyleSheet("font-weight: bold;")
+        layout.addWidget(header)
 
-        # Table
-        self.table = QTableWidget()
-        self.table.setColumnCount(2)
+        opts = QHBoxLayout()
+        self.auto_apply_chk = QCheckBox("Live apply (intent captured immediately)")
+        self.auto_apply_chk.stateChanged.connect(
+            lambda s: setattr(self, "auto_apply", s == Qt.CheckState.Checked)
+        )
+        opts.addWidget(self.auto_apply_chk)
+
+        self.status_lbl = QLabel("Idle")
+        opts.addWidget(self.status_lbl, 1, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(opts)
+
+        self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Key", "Value"])
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().resizeSection(0, 300)
-        self.populate_table()
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Fixed
+        )
+        self.table.horizontalHeader().resizeSection(0, 320)
         layout.addWidget(self.table)
 
-        # Buttons
-        btn_layout = QHBoxLayout()
-        self.save_btn = QPushButton("Save and Apply")
-        self.save_btn.clicked.connect(self.save_and_launch)
-        btn_layout.addWidget(self.save_btn)
-        layout.addLayout(btn_layout)
+        btns = QHBoxLayout()
+        save = QPushButton("Save (respect cooldown)")
+        save.clicked.connect(self.request_reconcile)
+        reload_btn = QPushButton("Reload From Disk")
+        reload_btn.clicked.connect(self.reload_from_disk)
+        btns.addWidget(save)
+        btns.addWidget(reload_btn)
+        layout.addLayout(btns)
 
         self.setLayout(layout)
-        self.table.resizeEvent = self.on_table_resize
 
-    def on_table_resize(self, event):
-        total_width = self.table.viewport().width()
-        key_width = self.table.columnWidth(0)
-        self.table.setColumnWidth(1, total_width - key_width)
-        event.accept()
-
+    # ---------------- Table ----------------
     def populate_table(self):
-        self.table.setRowCount(len(ALLOWED_KEY_VALUES))
-        preset_data = self.editor_presets.get(self.current_preset_name, {})
-        for row_index, (key, allowed_values) in enumerate(ALLOWED_KEY_VALUES.items()):
-            human_sorted_values = sort_human_readable(list(allowed_values))
-            self.table.setItem(row_index, 0, QTableWidgetItem(key))
+        self.table.setRowCount(0)
+
+        for key, allowed in ALLOWED_KEY_VALUES.items():
+            if key not in self.skin_data:
+                continue
+
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            key_item = QTableWidgetItem(key)
+            key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 0, key_item)
 
             combo = QComboBox()
             combo.setView(QListView())
-            combo.addItems(human_sorted_values)
+            combo.addItems(sort_human(allowed))
 
-            current_val = preset_data.get(key, "")
-            if current_val in human_sorted_values:
-                combo.setCurrentText(current_val)
+            current = self.skin_data.get(key)
+            if current in allowed:
+                combo.setCurrentText(current)
 
-            self.table.setCellWidget(row_index, 1, combo)
+            combo.currentTextChanged.connect(self.on_value_changed)
+            self.table.setCellWidget(row, 1, combo)
 
-    def change_preset(self, preset_name):
-        if preset_name in self.editor_presets:
-            self.current_preset_name = preset_name
+            # initialize desired intent from disk on first load
+            self.desired_cosmetics.setdefault(key, combo.currentText())
+
+        self.update_heatmap_styles()
+
+    # ---------------- Intent & Merge ----------------
+    def on_value_changed(self):
+        # Capture intent only for keys present and allowed
+        for row in range(self.table.rowCount()):
+            key = self.table.item(row, 0).text()
+            combo = self.table.cellWidget(row, 1)
+            if key in self.skin_data:
+                self.desired_cosmetics[key] = combo.currentText()
+
+        if self.auto_apply:
+            self.request_reconcile()
+
+    def collect_schema_safe_merge(self, base: dict):
+        merged = dict(base)
+        for key, val in self.desired_cosmetics.items():
+            if key in merged and key in ALLOWED_KEY_VALUES:
+                # Only overwrite if the value is allowed for that key
+                if val in ALLOWED_KEY_VALUES[key]:
+                    merged[key] = val
+        return merged
+
+    # ---------------- Cooldown & Reconcile ----------------
+    def request_reconcile(self):
+        # Schedule reconcile respecting cooldown
+        self.reconcile_scheduled = True
+        self.status_lbl.setText("Reconcile requested (waiting for quiet period)")
+
+    def maybe_reconcile_after_cooldown(self):
+        now = time.time()
+        quiet_for_ms = (now - self.last_write_seen_at) * 1000.0
+        if self.reconcile_scheduled and quiet_for_ms >= WRITE_QUIET_MS:
+            self.reconcile_scheduled = False
+            QTimer.singleShot(RECONCILE_DELAY_MS, self.reconcile_now)
+
+    def reconcile_now(self):
+        merged = self.collect_schema_safe_merge(self.skin_data)
+        atomic_write(self.skin_path, merged)
+        self.skin_data = merged
+        self.last_mtime = self.skin_path.stat().st_mtime
+        self.last_write_seen_at = time.time()
+        self.status_lbl.setText("Reconciled to disk")
+        self.update_heatmap_styles()
+
+    # ---------------- External Changes ----------------
+    def poll_file(self):
+        try:
+            mtime = self.skin_path.stat().st_mtime
+        except FileNotFoundError:
+            return
+
+        if mtime != self.last_mtime:
+            # Game (or something else) wrote the file
+            self.last_mtime = mtime
+            self.last_write_seen_at = time.time()
+            disk = load_json(self.skin_path)
+
+            # Detect conflicts against desired intent
+            conflicts = []
+            for key, desired in self.desired_cosmetics.items():
+                if key in disk and disk.get(key) != desired:
+                    conflicts.append(key)
+
+            # Record conflict history
+            for key in self.desired_cosmetics.keys():
+                self.conflict_history[key].append(1 if key in conflicts else 0)
+
+            self.skin_data = disk
             self.populate_table()
 
-    def create_new_preset(self):
-        existing = list(self.editor_presets.keys())
-        next_index = 1
-        while f"Preset{next_index}" in existing:
-            next_index += 1
-        preset_name = f"Preset{next_index}"
-        self.editor_presets[preset_name] = {}
-        self.preset_dropdown.addItem(preset_name)
-        self.preset_dropdown.setCurrentText(preset_name)
-        self.current_preset_name = preset_name
+            if conflicts:
+                self.status_lbl.setText(
+                    f"Detected overwrite ({len(conflicts)} conflicts) – waiting cooldown"
+                )
+                self.request_reconcile()
+            else:
+                self.status_lbl.setText("External write detected (no conflicts)")
+
+        # Attempt reconcile if quiet long enough
+        self.maybe_reconcile_after_cooldown()
+
+    def reload_from_disk(self):
+        self.skin_data = load_json(self.skin_path)
+        self.last_mtime = self.skin_path.stat().st_mtime
         self.populate_table()
+        self.status_lbl.setText("Reloaded from disk")
 
-    def save_and_launch(self):
-        preset_data = {}
-        for row_index in range(self.table.rowCount()):
-            key = self.table.item(row_index, 0).text()
-            combo = self.table.cellWidget(row_index, 1)
-            preset_data[key] = combo.currentText()
+    # ---------------- Heatmap ----------------
+    def update_heatmap_styles(self):
+        for row in range(self.table.rowCount()):
+            key = self.table.item(row, 0).text()
+            history = self.conflict_history.get(key)
+            if not history:
+                self.set_row_color(row, None)
+                continue
 
-        # Save to editor + remember last preset
-        self.editor_presets[self.current_preset_name] = preset_data
-        editor_data = {
-            "Presets": self.editor_presets,
-            "LastPreset": self.current_preset_name
-        }
-        save_json(EDITOR_PATH, editor_data)
+            count = sum(history)
+            if count >= HEATMAP_ESCALATE[1]:
+                self.set_row_color(row, "red")
+            elif count >= HEATMAP_ESCALATE[0]:
+                self.set_row_color(row, "amber")
+            else:
+                self.set_row_color(row, None)
 
-        # Save current preset to AvatarPresets.json
-        save_avatar_preset(AVATAR_PRESETS_PATH, self.current_preset_name, preset_data)
+    def set_row_color(self, row, level):
+        if level == "red":
+            bg = QColor("#5a1e1e")
+            fg = QColor("#ffd6d6")
+            widget_style = "background-color: #5a1e1e; color: #ffd6d6;"
+        elif level == "amber":
+            bg = QColor("#5a4a1e")
+            fg = QColor("#fff1c2")
+            widget_style = "background-color: #5a4a1e; color: #fff1c2;"
+        else:
+            bg = None
+            fg = None
+            widget_style = ""
 
-        self.show_auto_close_message("Saved successfully!", 5000)
+        for col in (0, 1):
+            item = self.table.item(row, col)
+            if item:
+                if bg:
+                    item.setBackground(QBrush(bg))
+                    item.setForeground(QBrush(fg))
+                else:
+                    item.setBackground(QBrush())
+                    item.setForeground(QBrush())
+            else:
+                widget = self.table.cellWidget(row, col)
+                if widget:
+                    widget.setStyleSheet(widget_style)
 
-        # Kill HytaleClient.exe only if it's already running
-        taskkill_if_running(Hytale_CLIENT_EXE)
-        if os.path.exists(LAUNCHER_PATH):
-            subprocess.Popen([LAUNCHER_PATH], shell=True)
-
-    def show_auto_close_message(self, message, timeout_ms=5000):
-        label = QLabel(message, self)
-        label.setStyleSheet("background-color: lightgreen; padding: 5px; border: 1px solid green; color: black;")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setWindowFlags(Qt.WindowType.ToolTip)
-        label.show()
-        QTimer.singleShot(timeout_ms, label.close)
-
-# ---------- RUN ----------
+# ===================== RUN =====================
 if __name__ == "__main__":
-    if not os.path.exists(AVATAR_PRESETS_PATH):
-        raise FileNotFoundError(f"AvatarPresets.json not found: {AVATAR_PRESETS_PATH}")
-    if not os.path.exists(LAUNCHER_PATH):
-        raise FileNotFoundError(f"HytaleLauncher.exe not found: {LAUNCHER_PATH}")
-
     app = QApplication(sys.argv)
-    window = AvatarEditor()
-    window.show()
+    w = CachedSkinEditor()
+    w.show()
     sys.exit(app.exec())
