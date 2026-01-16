@@ -13,6 +13,17 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QTextCharFormat, QColor, QTextCursor, QIcon
 
+#      ▄████  ██▓     ██▓▄▄▄█████▓▒██   ██▒ ██░ ██ 
+#     ██▒ ▀█▒▓██▒    ▓██▒▓  ██▒ ▓▒▒▒ █ █ ▒░▓██░ ██▒
+#    ▒██░▄▄▄░▒██░    ▒██▒▒ ▓██░ ▒░░░  █   ░▒██▀▀██░
+#    ░▓█  ██▓▒██░    ░██░░ ▓██▓ ░  ░ █ █ ▒ ░▓█ ░██ 
+#    ░▒▓███▀▒░██████▒░██░  ▒██▒ ░ ▒██▒ ▒██▒░▓█▒░██▓
+#     ░▒   ▒ ░ ▒░▓  ░░▓    ▒ ░░   ▒▒ ░ ░▓ ░ ▒ ░░▒░▒
+#      ░   ░ ░ ░ ▒  ░ ▒ ░    ░    ░░   ░▒ ░ ▒ ░▒░ ░
+#    ░ ░   ░   ░ ░    ▒ ░  ░       ░    ░   ░  ░░ ░
+#          ░     ░  ░ ░            ░    ░   ░  ░  ░
+#                                                  
+
 # ---------------- CONFIG ----------------
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -346,3 +357,4 @@ app = QApplication(sys.argv)
 win = Launcher()
 win.show()
 sys.exit(app.exec())
+
