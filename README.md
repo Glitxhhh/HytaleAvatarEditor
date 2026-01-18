@@ -8,4 +8,4 @@
 ### will be doing a major overhaul of the code next week to target the online avatar system, and overcoming the syncing it does of your cosmetics, if someone is willing to buy me hytale rewrite will start sooner
 
 
-<img width="578" height="176" alt="Screenshot 2026-01-17 200636" src="https://github.com/user-attachments/assets/4507f8da-eef8-401c-8f43-f64c1ae64a7f" />
+<img width="566" height="133" alt="Screenshot 2026-01-17 200736" src="https://github.com/user-attachments/assets/f6452827-9a40-4806-9ce2-f37ac169c962" />
